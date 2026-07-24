@@ -1,0 +1,84 @@
+---
+title: 같은 장애로 알림 30번 보내지 않기
+description: APIGuard의 장애 알림에 Redis TTL 쿨다운을 넣으면서 정한 발송 조건과 남은 숙제.
+pubDate: 2026-07-24
+tags: ['apiguard', 'spring', 'redis']
+draft: true
+---
+
+APIGuard는 등록된 외부 API를 스케줄러가 주기적으로 헬스체크하고, 연속 실패가 임계치를 넘으면 이메일/Slack/웹훅으로 알림을 보내는 도구다. 그런데 이 구조에는 함정이 하나 있다. 장애가 30분 지속되면, 체크 주기마다 임계치 조건이 계속 성립하니까 같은 알림이 수십 번 나간다.
+
+알림 도구의 역설이다. 알림이 너무 많으면 사람은 알림을 끄거나 무시하게 되고, 그 순간 도구는 없는 것과 같아진다. 그래서 "장애를 감지하는 것"만큼 "같은 장애를 한 번만 알리는 것"이 중요했다.
+
+## 연속 실패부터 세기
+
+먼저 발송 조건. 단발성 실패는 네트워크 순단일 수 있어서, 알림 설정마다 임계치(threshold, 기본 3)를 두고 연속 실패가 그만큼 쌓였을 때만 발송 대상으로 본다.
+
+```java
+int maxThreshold = activeAlerts.stream()
+    .mapToInt(AlertConfig::getThreshold)
+    .max()
+    .orElse(3);
+
+List<CheckResult> recentResults = checkResultRepository
+    .findByEndpointIdOrderByCheckedAtDesc(endpointId, PageRequest.of(0, maxThreshold));
+
+int consecutiveFailures = 0;
+for (CheckResult result : recentResults) {
+    if (result.getStatus() == CheckStatus.SUCCESS) {
+        break;
+    }
+    consecutiveFailures++;
+}
+```
+
+한 엔드포인트에 알림 설정이 여러 개 붙을 수 있어서, 조회는 그중 가장 큰 임계치만큼만 한다. 최근 결과를 최신순으로 훑다가 성공이 나오는 순간 멈추면 그게 연속 실패 수다. 전체 이력을 뒤질 이유가 없다.
+
+## 쿨다운은 Redis TTL에 맡긴다
+
+발송 조건을 넘었어도 "최근에 이미 보낸 알림인가"를 확인해야 한다. 여기를 Redis로 풀었다.
+
+```java
+private static final String ALERT_SENT_KEY_PREFIX = "ALERT_SENT:";
+private static final Duration ALERT_COOLDOWN = Duration.ofMinutes(30);
+
+String redisKey = ALERT_SENT_KEY_PREFIX + alertConfig.getId();
+
+Boolean alreadySent = stringRedisTemplate.hasKey(redisKey);
+if (Boolean.TRUE.equals(alreadySent)) {
+    return;
+}
+```
+
+알림 설정 ID별로 `ALERT_SENT:{id}` 키를 30분 TTL로 박아두고, 키가 살아 있는 동안은 발송을 건너뛴다. 쿨다운의 "만료"라는 개념이 TTL과 정확히 일치해서, 청소 로직을 한 줄도 쓸 필요가 없다.
+
+DB 컬럼으로도 물론 가능하다. `lastSentAt`을 저장하고 매번 `now() - lastSentAt > 30분`을 비교하면 된다. 그런데 이 값은 체크 주기마다 읽히는 값이고, 본질적으로 "일정 시간 뒤에 스스로 사라져야 하는 상태"다. 영속화할 가치가 없는 휘발성 상태를 DB에 넣으면 비교 로직과 만료 관리가 애플리케이션 코드로 새어 나온다. 이런 상태는 처음부터 TTL이 있는 저장소에 두는 쪽이 코드가 짧고 의도도 분명하다.
+
+## 쿨다운은 발송이 성공했을 때만 건다
+
+이 설계에서 순서가 제일 중요했던 부분이다. 쿨다운 키를 언제 세팅하느냐.
+
+```java
+AlertDelivery delivery = sendAlert(alertConfig, endpoint, failures, false);
+if (delivery.getStatus() == AlertDeliveryStatus.SUCCESS) {
+    stringRedisTemplate.opsForValue().set(redisKey, "1", ALERT_COOLDOWN);
+}
+```
+
+발송을 시도하기 전에 키부터 박으면 코드가 조금 단순해지지만, Slack 웹훅이 일시적으로 죽어서 발송이 실패한 경우에도 30분간 재시도가 막힌다. 장애 알림이 조용히 증발하는 최악의 시나리오다.
+
+반대로 성공했을 때만 키를 걸면, 발송 실패 시 키가 없는 상태로 남으니까 다음 체크 사이클에 자연스럽게 재시도된다. 별도의 재시도 큐 없이, 키 세팅 위치 하나로 재시도를 공짜로 얻는 셈이다.
+
+발송 결과는 성공이든 실패든 `AlertDelivery`로 전부 저장한다. "알림이 안 왔는데요"라는 상황에서 발송을 안 한 건지, 하고 실패한 건지, 쿨다운에 걸린 건지 구분할 수 없으면 운영이 안 된다.
+
+## 테스트 발송은 쿨다운을 안 탄다
+
+알림 채널을 등록하면 제대로 연결됐는지 확인하고 싶어진다. 그래서 합성 실패(synthetic failure)를 만들어 보내는 테스트 발송 API가 있는데, 이 경로는 쿨다운 체크도, 쿨다운 세팅도 하지 않는다.
+
+테스트 발송이 쿨다운 키를 세팅해 버리면, 채널 연결을 확인한 직후 30분 동안 실제 장애 알림이 막히는 황당한 상황이 생긴다. 반대 방향도 마찬가지다. 같은 "발송"이라도 운영 알림과 테스트 발송은 상태를 공유하면 안 된다.
+
+## 남은 숙제
+
+지금 구조는 `hasKey`로 확인하고 발송 후 `set`하는 두 단계라서, 인스턴스를 여러 대로 늘리면 그 사이에 다른 인스턴스가 끼어들어 중복 발송될 수 있다. 단일 인스턴스에서는 문제가 없지만, 수평 확장을 하려면 `SET key value NX EX 1800`으로 "키 선점"을 원자적으로 처리하고, 발송 실패 시 키를 지우는 방식으로 바꿔야 한다.
+
+회복 알림도 아직 없다. 장애 알림만 있고 "복구됐다"는 알림이 없으면, 받는 쪽은 결국 대시보드를 열어 확인하게 된다. Incident가 resolved로 넘어가는 시점에 회복 알림을 한 번 보내는 것까지가 이 기능의 완성이라고 생각한다.
