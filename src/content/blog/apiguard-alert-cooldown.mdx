@@ -3,7 +3,6 @@ title: 같은 장애로 알림 30번 보내지 않기
 description: APIGuard의 장애 알림에 Redis TTL 쿨다운을 넣으면서 정한 발송 조건과 남은 숙제.
 pubDate: 2026-07-24
 tags: ['apiguard', 'spring', 'redis']
-draft: true
 ---
 
 APIGuard는 등록된 외부 API를 스케줄러가 주기적으로 헬스체크하고, 연속 실패가 임계치를 넘으면 이메일/Slack/웹훅으로 알림을 보내는 도구다. 그런데 이 구조에는 함정이 하나 있다. 장애가 30분 지속되면, 체크 주기마다 임계치 조건이 계속 성립하니까 같은 알림이 수십 번 나간다.
