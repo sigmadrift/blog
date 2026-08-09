@@ -1,0 +1,93 @@
+---
+title: 레거시 DB를 건드리지 않고 새 기능 얹기
+description: 운영 중인 MES DB 옆에 신규 PostgreSQL을 세우면서 자동설정을 끄고 이중 데이터소스를 수동 구성한 기록.
+pubDate: 2026-08-09
+tags: ['spring', 'mes', 'database']
+---
+
+사내에서 쓰는 MES 웹 시스템을 새로 만들게 됐다. 문제는 데이터였다. 기존 MES의 SQL Server DB에는 수년치 생산·재고·출하 데이터가 쌓여 있었고, 다른 시스템들이 여전히 그 DB를 보고 있었다. 스키마를 바꾸거나 데이터를 옮기는 순간 현장이 멈출 수 있다. 그렇다고 새 기능의 데이터까지 그 DB에 넣으면, 내가 그 "건드리면 안 되는 시스템"을 하나 더 키우는 셈이 된다.
+
+그래서 이관 대신 공존을 택했다. 기존 DB는 읽기 전용으로만 연동하고, 새 기능의 데이터는 별도 PostgreSQL에 쌓는다. Spring Boot 하나에 데이터소스 두 개를 물리는 구조다.
+
+## 자동설정부터 끈다
+
+데이터소스가 두 개가 되는 순간 Spring Boot의 자동설정은 도움이 아니라 방해가 된다. 어느 쪽을 "기본"으로 잡을지 모호해지고, 절반만 자동인 설정은 어디까지 프레임워크가 해주는 건지 추적하기 어렵다. 그래서 관련 자동설정을 전부 끄고 시작했다.
+
+```yaml
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceTransactionManagerAutoConfiguration
+  flyway:
+    enabled: false   # Flyway도 직접 Bean으로 만든다
+```
+
+프로퍼티도 `spring.datasource.*`를 버리고 `app.datasource.mes`, `app.datasource.app` 같은 커스텀 네임스페이스로 분리했다. "이 설정은 프레임워크가 읽는 게 아니라 내 설정 클래스가 읽는다"는 게 이름에서 드러난다.
+
+## 레거시 쪽: 조회 전용 창구
+
+기존 MES DB 연동은 커넥션 수준에서 읽기 전용을 강제했다.
+
+```java
+@Bean
+public DataSource mesDataSource() {
+    HikariDataSource ds = mesDataSourceProperties()
+            .initializeDataSourceBuilder()
+            .type(HikariDataSource.class)
+            .build();
+    ds.setReadOnly(true);
+    return ds;
+}
+
+@Bean
+public NamedParameterJdbcTemplate mesJdbcTemplate(
+        @Qualifier("mesDataSource") DataSource ds) {
+    return new NamedParameterJdbcTemplate(ds);
+}
+```
+
+이쪽에는 JPA도, 엔티티도, 트랜잭션 매니저도 없다. 처음에는 트랜잭션 매니저가 없는 게 찜찜했는데, 생각해 보면 당연했다. 쓰기가 없는데 트랜잭션 경계가 왜 필요한가. 커밋할 것도 롤백할 것도 없다. 매니저를 아예 만들지 않으니 "실수로 레거시에 쓰기 트랜잭션을 여는" 경로 자체가 사라졌다. 격리는 규칙으로 지키는 것보다 구조로 막는 쪽이 싸다.
+
+## 신규 쪽: 순서가 문제였다
+
+새 PostgreSQL 쪽은 JPA + Flyway 조합이고, 여기가 이 구성의 핵심 함정이었다. 자동설정을 쓸 때는 Boot가 알아서 보장해 주던 것 — Flyway 마이그레이션이 끝난 뒤에 JPA가 스키마를 검증한다는 순서 — 가 자동설정을 끄는 순간 함께 사라진다. `ddl-auto: validate`로 잡아 놨는데 Flyway보다 EntityManagerFactory가 먼저 뜨면, 아직 마이그레이션 안 된 스키마를 검증하다 부팅이 실패한다.
+
+해결은 Bean 의존성으로 순서를 강제하는 것이다.
+
+```java
+@Bean
+public Flyway flyway(@Qualifier("appDataSource") DataSource ds) {
+    Flyway flyway = Flyway.configure()
+            .dataSource(ds)
+            .locations("classpath:db/migration")
+            .load();
+    flyway.migrate();
+    return flyway;
+}
+
+@Bean
+@Primary
+public LocalContainerEntityManagerFactoryBean appEntityManagerFactory(
+        EntityManagerFactoryBuilder builder, Flyway flyway) {
+    // Flyway를 파라미터로 받는 것 자체가 목적이다.
+    // 마이그레이션이 끝나야 이 Bean이 만들어진다.
+    ...
+}
+```
+
+`appEntityManagerFactory`가 `Flyway`를 파라미터로 받지만 메서드 안에서 쓰지는 않는다. 오직 "Flyway Bean 초기화가 먼저"라는 의존 관계를 컨테이너에 알리기 위한 파라미터다. `@DependsOn`으로도 되지만, 문자열 이름보다 타입 의존이 리팩터링에 안전하다.
+
+## 트랜잭션 매니저는 결국 하나
+
+구성이 끝나고 보니 트랜잭션 매니저는 신규 쪽 `JpaTransactionManager` 하나뿐이다. 레거시는 읽기 전용이라 필요 없고, 신규 쪽은 JPA와 JdbcTemplate을 섞어 쓰는데도 매니저 하나로 충분하다.
+
+이게 되는 이유는 `JpaTransactionManager`가 트랜잭션을 열 때 해당 DataSource의 커넥션을 스레드에 바인딩해 두기 때문이다. 같은 DataSource를 바라보는 `JdbcTemplate`은 새 커넥션을 뽑는 대신 그 커넥션에 편승한다. 그래서 JPA 엔티티 저장과 JdbcTemplate 배치 insert가 한 트랜잭션에서 함께 롤백된다. 반대로 말하면, 다른 DataSource를 쓰는 순간 이 편승은 조용히 깨진다. 이중 데이터소스에서 `@Transactional`을 쓸 때 어느 매니저가 잡히는지 명시하는 습관(`@Transactional(transactionManager = "...")`)이 필요한 이유다.
+
+## 남은 숙제
+
+부팅 시퀀스에 `flyway.repair()`를 넣어 뒀다. 개발 중에 마이그레이션 파일을 고치면 checksum 불일치로 부팅이 막히는 게 귀찮아서였는데, 운영에서는 이야기가 다르다. repair는 "이력과 파일이 어긋났다"는 신호를 자동으로 지워 버린다. 어긋남을 조용히 무마하는 것과 시끄럽게 실패하는 것 중 운영에서 옳은 쪽은 후자다. 개발 프로파일에서만 repair를 돌리도록 분리하는 게 다음 할 일이다.
+
+`@Transactional`에 매니저를 명시하지 않은 서비스도 몇 군데 남아 있다. 지금은 `@Primary` 덕에 올바른 매니저가 잡히지만, 이건 "맞게 동작한다"가 아니라 "우연히 맞다"에 가깝다. 기본값에 기대는 코드는 기본값이 바뀌는 날 부러진다.
+
+마지막으로 레거시 쪽 무거운 조회 쿼리의 타임아웃을 180초로 잡으면서 프론트엔드의 요청 타임아웃도 같은 값으로 맞췄다. 클라이언트와 서버가 서로 다른 한계를 갖고 있으면 한쪽만 끊긴 채 다른 쪽은 계속 일하는 어정쩡한 상태가 생긴다. 타임아웃은 각자 정하는 설정값이 아니라 양쪽이 합의하는 계약이라는 것을, 이 구성을 운영하면서 배웠다.
